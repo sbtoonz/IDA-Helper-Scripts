@@ -9,7 +9,7 @@ It provides a quick way to **smoke-test driver access** from user-mode:
 - Enumerates known IOCTLs and shows DEV/FUNC/Method/Access
 - Optionally sends **zeroed test buffers** to each IOCTL to see which routes succeed
 
-It’s meant for **diagnostic probing only** — not exploitation or payload logic.
+It’s meant for **diagnostic probing only**
 
 ---
 
