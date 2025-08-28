@@ -1,19 +1,22 @@
 # IDA 7.7+ script
-# Cross-process memory hunter v5.3
+# Cross-process memory hunter v5.4
 # - IOCTL recovery (IoStackLocation & IRP-walk)
 # - Handler discovery & indirect call resolution
 # - Map protections
 # - memmove direction with userbuf vs remote-map classification
 # - Cross-callee remote map tagging (mapper returns in RAX)
-# - **NEW**: Export a ready-to-use C++ user-mode header with recovered IOCTLs
+# - Device name/link discovery (IoCreateSymbolicLink/WDF + string harvest)
+# - C++ header export with all IOCTLs + device candidates + try_open_any()
 #
+# Output header: xpmem_user.hpp (change HEADER_OUT_PATH below to customize)
+
 import idaapi, idc, ida_bytes, ida_funcs, ida_nalt, ida_xref, idautils, ida_segment
 import os
 import datetime
 
 # ============================ Config ============================
-HEADER_OUT_PATH = "xpmem_user.hpp"    # change me if you want a different path
-DEFAULT_DEVICE_SYMLINK = r"\\.\YourDeviceName"  # tweak after you know it
+HEADER_OUT_PATH = "xpmem_user.hpp"    # change if you want a different location/filename
+DEFAULT_DEVICE_SYMLINK = r"\\.\YourDeviceName"  # used only if we can't discover one
 
 # ============================ Targets ============================
 TARGET_APIS = {
@@ -238,7 +241,7 @@ def recover_name_for_mmgsra_call(call_ea):
         cand = [ea for ea in find_rtlinit_calls_in_func(f.start_ea) if ea < call_ea]
         cand.sort(reverse=True)
         for ru in cand:
-            k2, v2, _, _ = backtrack_reg_value(f, ru, "rdx", max_back=120)
+            k2, v2, _, _ = backtrack_reg_value(f, ru, "rdx", max_back=160)
             if k2 == "imm" and v2 and seg_contains(v2):
                 s = read_unicode_from(v2, 0x800)
                 if s: return s, f"RtlInitUnicodeString buffer @{v2:#x}"
@@ -449,7 +452,7 @@ def record_remote_map_regs(fn_ea):
                 tgt, _, _ = resolve_indirect_call(insn)
                 callee = tgt
             if callee and ida_funcs.get_func(callee) and ida_funcs.get_func(callee).start_ea in mappers:
-                # Capture reg <- rax after call
+                # After call: reg <- rax
                 ea2 = idc.next_head(insn); steps = 0
                 while ea2 != idaapi.BADADDR and steps < 32 and f.contains(ea2):
                     m = idc.print_insn_mnem(ea2).lower()
@@ -608,34 +611,170 @@ def find_handler_calls_near(f, site_ea, fwd_limit=80):
         out.append((ce, callee_ea, fn_name(callee_ea) if callee_ea else "indirect"))
     return out
 
-# ============================ Header generation ============================
-def _sanitize_sym(name):
-    # Turn e.g. DEV=0x426F FUNC=0x950 into IOCTL_DEV_426F_FUNC_0950, etc.
-    return "".join(ch if ch.isalnum() or ch=='_' else '_' for ch in name)
+# ============================ Device name resolution ============================
+def _collect_unicode_literals():
+    """Return {ea_of_buffer: decoded_wstring} for embedded UTF-16LE literals that look dev/links."""
+    hits = {}
+    for s in idautils.Strings():
+        try:
+            txt = str(s)
+        except Exception:
+            continue
+        if any(p.lower() in txt.lower() for p in ["\\device\\", "\\dosdevices\\", "\\??\\", "global??"]):
+            ea = int(s.ea)
+            w = read_unicode_from(ea, 0x400)
+            if w and any(w.lower().startswith(p) for p in ["\\device\\", "\\dosdevices\\", "\\??\\", "\\global??\\", "\\global??"]):
+                hits[ea] = w
+            else:
+                if txt.startswith("\\"):
+                    hits[ea] = txt
+    return hits
 
+def _unicode_arg_from_call(call_ea, reg_name):
+    """Given a call site & arg reg, chase UNICODE_STRING or PWSTR buffer -> return text."""
+    f = ida_funcs.get_func(call_ea)
+    if not f: return None
+    kind, val, _, _ = backtrack_reg_value(f, call_ea, reg_name, max_back=220)
+    if kind == "imm" and val and seg_contains(val):
+        us = read_unicode_string_struct(val)
+        if us: return us
+        lit = read_unicode_from(val, 0x800)
+        if lit: return lit
+    if kind == "stack":
+        for ru in reversed(find_rtlinit_calls_in_func(f.start_ea)):
+            if ru < call_ea:
+                k2, v2, _, _ = backtrack_reg_value(f, ru, "rdx", max_back=160)
+                if k2 == "imm" and v2 and seg_contains(v2):
+                    s = read_unicode_from(v2, 0x800)
+                    if s: return s
+    return None
+
+def _norm_user_doslink(s):
+    """
+    Map NT-style names to user-mode \\.\ links:
+      \DosDevices\Foo  -> \\.\Foo
+      \??\Foo          -> \\.\Foo
+      GLOBAL??\Foo     -> \\.\Foo
+    Return (user_path, nt_path) tuple where user_path may be None.
+    """
+    if not s: return (None, None)
+    sl = s.replace("\\\\", "\\").strip()
+    nt = sl
+    user = None
+    for pref in ["\\DosDevices\\", "\\??\\", "\\GLOBAL??\\", "\\GLOBAL??", "\\DosDevices"]:
+        if sl.lower().startswith(pref.lower()):
+            tail = sl[len(pref):].lstrip("\\")
+            if tail:
+                user = r"\\.\{}".format(tail)
+            break
+    return (user, nt)
+
+def resolve_device_paths():
+    """
+    Discover user-mode device links and NT device names.
+    Returns: {'user_links':[...], 'nt_devices':[...], 'raw': set([...])}
+    """
+    user_links = set()
+    nt_devices = set()
+    raw = set()
+
+    # literals
+    lit = _collect_unicode_literals()
+    for _, s in lit.items():
+        u, n = _norm_user_doslink(s)
+        if u: user_links.add(u)
+        if n and n.lower().startswith("\\device\\"): nt_devices.add(n)
+        raw.add(s)
+
+    # IoCreateSymbolicLink
+    for api in ("IoCreateSymbolicLink",):
+        for iat in find_import_eas_by_name(api):
+            for xr in idautils.XrefsTo(iat):
+                if idc.print_insn_mnem(xr.frm) != "call": continue
+                link = _unicode_arg_from_call(xr.frm, "rcx")
+                dev  = _unicode_arg_from_call(xr.frm, "rdx")
+                for s in (link, dev):
+                    if s: raw.add(s)
+                u, _ = _norm_user_doslink(link)
+                if u: user_links.add(u)
+                if dev and dev.lower().startswith("\\device\\"): nt_devices.add(dev)
+
+    # IoCreateDevice / IoCreateDeviceSecure -> device name in r8
+    for api in ("IoCreateDevice", "IoCreateDeviceSecure"):
+        for iat in find_import_eas_by_name(api):
+            for xr in idautils.XrefsTo(iat):
+                if idc.print_insn_mnem(xr.frm) != "call": continue
+                dev = _unicode_arg_from_call(xr.frm, "r8")
+                if dev:
+                    raw.add(dev)
+                    if dev.lower().startswith("\\device\\"): nt_devices.add(dev)
+
+    # KMDF symbolic link & names
+    for api in ("WdfDeviceCreateSymbolicLink",):
+        for iat in find_import_eas_by_name(api):
+            for xr in idautils.XrefsTo(iat):
+                if idc.print_insn_mnem(xr.frm) != "call": continue
+                link = _unicode_arg_from_call(xr.frm, "rdx")
+                if link:
+                    raw.add(link)
+                    u, _ = _norm_user_doslink(link)
+                    if u: user_links.add(u)
+
+    for api in ("WdfDeviceInitAssignName",):
+        for iat in find_import_eas_by_name(api):
+            for xr in idautils.XrefsTo(iat):
+                if idc.print_insn_mnem(xr.frm) != "call": continue
+                dev = _unicode_arg_from_call(xr.frm, "rdx")
+                if dev:
+                    raw.add(dev)
+                    if dev.lower().startswith("\\device\\"): nt_devices.add(dev)
+
+    # last chance normalize
+    for s in list(raw):
+        u, n = _norm_user_doslink(s)
+        if u: user_links.add(u)
+        if n and n.lower().startswith("\\device\\"): nt_devices.add(n)
+
+    def score_user(u): return len(u or "zzzz")
+    def score_nt(n):   return len(n or "zzzz")
+    return {
+        "user_links": sorted(user_links, key=score_user),
+        "nt_devices": sorted(nt_devices, key=score_nt),
+        "raw": raw
+    }
+
+# ============================ Header generation ============================
 def make_ioctl_const_name(code):
     dev, func, meth, acc = decode_ioctl(code)
     return f"IOCTL_DEV_{dev:04X}_FUNC_{func:03X}_{METHOD_NAMES.get(meth,'M'+str(meth))}_{ACCESS_NAMES.get(acc,'ACC'+str(acc)).replace('|','_').replace(' ','')}"
 
-def emit_header(ioctls, out_path=HEADER_OUT_PATH):
+def emit_header(ioctls, out_path=HEADER_OUT_PATH, device_candidates=None):
     """
     ioctls: iterable of integers (DWORD) recovered
-    Writes a standalone, reusable header with:
-      - constexpr DWORD IOCTL_* constants
-      - RAII Device wrapper and helpers
-      - known_ioctls() table
+    device_candidates: dict from resolve_device_paths() or None
     """
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    lines = []
 
-    # preface & includes
+    # Choose a default device path
+    user_paths = (device_candidates or {}).get("user_links", []) if device_candidates else []
+    chosen = user_paths[0] if user_paths else DEFAULT_DEVICE_SYMLINK
+
+    lines = []
     lines.append("#pragma once")
     lines.append("#ifndef XPMEM_USER_HPP")
     lines.append("#define XPMEM_USER_HPP")
     lines.append("")
-    lines.append("// Auto-generated by xpmem_hunter v5.3 in IDA")
+    lines.append("// Auto-generated by xpmem_hunter v5.4 in IDA")
     lines.append(f"// Generated: {ts}")
-    lines.append("// Edit the device path below once you know your driver's symbolic link.")
+    if user_paths:
+        if len(user_paths) > 1:
+            lines.append("// Device path candidates (in discovery order):")
+            for u in user_paths:
+                lines.append(f"//   {u}")
+        else:
+            lines.append(f"// Device path candidate: {user_paths[0]}")
+    else:
+        lines.append("// No device path discovered; edit kDefaultDevicePath manually.")
     lines.append("")
     lines.append("#include <windows.h>")
     lines.append("#include <string>")
@@ -643,6 +782,7 @@ def emit_header(ioctls, out_path=HEADER_OUT_PATH):
     lines.append("#include <vector>")
     lines.append("#include <type_traits>")
     lines.append("#include <cstdint>")
+    lines.append("#include <array>")
     lines.append("")
     lines.append("#ifndef CTL_CODE")
     lines.append("  #define CTL_CODE(DeviceType, Function, Method, Access) \\")
@@ -651,18 +791,28 @@ def emit_header(ioctls, out_path=HEADER_OUT_PATH):
     lines.append("")
     lines.append("namespace xpmem {")
     lines.append("")
-    lines.append(f'inline constexpr const wchar_t* kDefaultDevicePath = LR"({DEFAULT_DEVICE_SYMLINK})";')
+    lines.append(f'inline constexpr const wchar_t* kDefaultDevicePath = LR"({chosen})";')
+    if user_paths and len(user_paths) > 1:
+        lines.append("inline constexpr std::array<const wchar_t*, %d> kAllDevicePaths = {" % (len(user_paths)))
+        for i,u in enumerate(user_paths):
+            comma = "," if i < len(user_paths)-1 else ""
+            lines.append(f'    LR"({u})"{comma}')
+        lines.append("};")
+    else:
+        lines.append("inline constexpr std::array<const wchar_t*, 1> kAllDevicePaths = { kDefaultDevicePath };")
     lines.append("")
 
     # IOCTL constants
     lines.append("// ================= IOCTLs recovered =================")
-    if not ioctls:
-        lines.append("// (none found in this run)")
     names = []
     for code in sorted(set(ioctls)):
         name = make_ioctl_const_name(code)
         names.append((name, code))
-        lines.append(f"constexpr DWORD {name} = 0x{code:08X}u;  // {fmt_ioctl(code)}")
+        # Also include decoded info as a comment
+        dev, func, meth, acc = decode_ioctl(code)
+        lines.append(f"constexpr DWORD {name} = 0x{code:08X}u;  // DEV=0x{dev:04X} FUNC=0x{func:03X} {METHOD_NAMES.get(meth,str(meth))} {ACCESS_NAMES.get(acc,str(acc))}")
+    if not names:
+        lines.append("// (none found in this run)")
     lines.append("")
 
     # error + device wrapper
@@ -725,6 +875,21 @@ def emit_header(ioctls, out_path=HEADER_OUT_PATH):
     lines.append("    std::wstring path_;")
     lines.append("};")
     lines.append("")
+    lines.append("// Try opening any discovered device path; returns a valid Device or throws after last failure.")
+    lines.append("inline Device try_open_any(DWORD access = GENERIC_READ | GENERIC_WRITE, DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE, DWORD flags = FILE_ATTRIBUTE_NORMAL) {")
+    lines.append("    for (auto wpath : kAllDevicePaths) {")
+    lines.append("        try {")
+    lines.append("            Device d(std::wstring(wpath), access, share, flags);")
+    lines.append("            return d;")
+    lines.append("        } catch (const win32_error&) {")
+    lines.append("            // try next")
+    lines.append("        }")
+    lines.append("    }")
+    lines.append("    // last resort: default path (even if already in list)")
+    lines.append("    Device d(std::wstring(kDefaultDevicePath), access, share, flags);")
+    lines.append("    return d;")
+    lines.append("}")
+    lines.append("")
     lines.append("// ================= Example payload scaffolding =================")
     lines.append("#pragma pack(push, 1)")
     lines.append("struct XpMemGenericIn {")
@@ -773,7 +938,7 @@ def emit_header(ioctls, out_path=HEADER_OUT_PATH):
 
 # ============================ Main ============================
 def main():
-    print("[*] Cross-process memory hunter v5.3: IOCTL flow + IRP-walk + handlers + indirect resolution + memmove direction + cross-callee map + protections + header export")
+    print("[*] Cross-process memory hunter v5.4: IOCTL flow + IRP-walk + handlers + indirect resolution + memmove direction + cross-callee map + protections + device discovery + header export")
 
     direct = find_direct_calls_to_targets()
     if direct:
@@ -925,26 +1090,32 @@ def main():
     else:
         print("[i] No IOCTLs recovered via IoStack/IRP walk")
 
-    # ================= Header export =================
+    # ================= Device discovery + Header export =================
     print("\n=============== SUMMARY ================")
     if ioctl_all:
         for v in sorted(ioctl_all):
             print(f"- {fmt_ioctl(v)}")
-        try:
-            outp = emit_header(sorted(ioctl_all), HEADER_OUT_PATH)
-            print(f"\n[+] C++ header emitted: {outp}")
-            print(f"    -> edit xpmem::kDefaultDevicePath if needed (currently: {DEFAULT_DEVICE_SYMLINK})")
-        except Exception as e:
-            print(f"[!] Failed to write header: {e}")
     else:
         print("No IOCTLs found via data-flow.")
-        # still emit a skeleton header so you can wire device path & compile
-        try:
-            outp = emit_header([], HEADER_OUT_PATH)
-            print(f"[i] Skeleton C++ header emitted (no IOCTLs): {outp}")
-            print(f"    -> edit xpmem::kDefaultDevicePath and rerun after more reversing")
-        except Exception as e:
-            print(f"[!] Failed to write skeleton header: {e}")
+
+    devinfo = resolve_device_paths()
+    if devinfo["user_links"]:
+        print("\n[+] Device link candidates (user-mode):")
+        for u in devinfo["user_links"]:
+            print(f"    {u}")
+    if devinfo["nt_devices"]:
+        print("[+] NT device name candidates:")
+        for n in devinfo["nt_devices"]:
+            print(f"    {n}")
+
+    try:
+        outp = emit_header(sorted(ioctl_all), HEADER_OUT_PATH, device_candidates=devinfo)
+        print(f"\n[+] C++ header emitted: {outp}")
+        chosen = devinfo["user_links"][0] if devinfo["user_links"] else DEFAULT_DEVICE_SYMLINK
+        print(f"    -> kDefaultDevicePath set to: {chosen}")
+    except Exception as e:
+        print(f"[!] Failed to write header: {e}")
+
     print("")
 
 if __name__ == "__main__":
