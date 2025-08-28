@@ -1,11 +1,21 @@
-xpmem_probe.exe [--list] [--open] [--poke | --poke-all] [--in N] [--out N] [--path \\.\DeviceName]
+# xpmem_probe
 
-  --list          Print device paths and known IOCTLs (default if no flags)
-  --open          Attempt to open each discovered device path
-  --poke          Probe each IOCTL once against the first openable device
-  --poke-all      Probe each IOCTL against every openable device
-  --in N          Input buffer size in bytes (default 0)
-  --out N         Output buffer size in bytes (default 0)
-  --path P        Override: only try this device path
-  --help          Show help
-Exit codes: 0 = at least one device opened; 1 = none opened; 2 = bad args
+`xpmem_probe` is a small companion CLI that pairs with the auto-generated
+[`xpmem_user.hpp`](./xpmem_user.hpp) header your IDA analysis script produces.
+It provides a quick way to **smoke-test driver access** from user-mode:
+
+- Lists device paths (`\\.\Foo`) discovered by the script
+- Attempts to open handles to those devices
+- Enumerates known IOCTLs and shows DEV/FUNC/Method/Access
+- Optionally sends **zeroed test buffers** to each IOCTL to see which routes succeed
+
+It’s meant for **diagnostic probing only** — not exploitation or payload logic.
+
+---
+
+## Build
+
+### MSVC (Developer Command Prompt)
+
+```bat
+cl /std:c++17 /O2 xpmem_probe.cpp /link user32.lib
