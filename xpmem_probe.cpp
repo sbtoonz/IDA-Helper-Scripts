@@ -1,6 +1,9 @@
 #include <windows.h>
 #include <cstdio>
 #include <cstdint>
+#include <cstddef>   // std::byte
+#include <cstdlib>   // std::strtoull
+#include <cstring>   // std::strlen
 #include <vector>
 #include <string>
 #include <iostream>
@@ -18,27 +21,23 @@ using std::cerr;
 using std::endl;
 
 static void print_usage(const char* argv0) {
-    std::cout <<
-R"(xpmem_probe — smoke-test CLI for your generated xpmem_user.hpp
-
-Usage:
-  )" << argv0 << R"( [--list] [--open] [--poke | --poke-all] [--in N] [--out N] [--path \\.\DeviceName]
-
-Options:
-  --list          Print device paths and known IOCTLs (default if no flags)
-  --open          Attempt to open each discovered device path
-  --poke          Probe each IOCTL once against the first openable device
-  --poke-all      Probe each IOCTL against every openable device
-  --in N          Input buffer size in bytes (default 0)
-  --out N         Output buffer size in bytes (default 0)
-  --path P        Override: only try this device path
-  --help          Show this help
-
-Exit codes:
-  0 = at least one device opened
-  1 = no device opened
-  2 = bad arguments
-)";
+    std::cout
+        << "xpmem_probe — smoke-test CLI for your generated xpmem_user.hpp\n\n"
+        << "Usage:\n"
+        << "  " << argv0 << " [--list] [--open] [--poke | --poke-all] [--in N] [--out N] [--path \\\\.\\DeviceName]\n\n"
+        << "Options:\n"
+        << "  --list          Print device paths and known IOCTLs (default if no flags)\n"
+        << "  --open          Attempt to open each discovered device path\n"
+        << "  --poke          Probe each IOCTL once against the first openable device\n"
+        << "  --poke-all      Probe each IOCTL against every openable device\n"
+        << "  --in N          Input buffer size in bytes (default 0)\n"
+        << "  --out N         Output buffer size in bytes (default 0)\n"
+        << "  --path P        Override: only try this device path\n"
+        << "  --help          Show this help\n\n"
+        << "Exit codes:\n"
+        << "  0 = at least one device opened\n"
+        << "  1 = no device opened\n"
+        << "  2 = bad arguments\n";
 }
 
 static inline uint32_t IOCTL_DeviceType(uint32_t code) { return (code >> 16) & 0xFFFFu; }
@@ -107,8 +106,7 @@ static bool parse_args(int argc, char** argv, Args& a) {
         }
         else if (t == "--path" && i+1 < argc) {
             std::string p = argv[++i];
-            // convert to wide
-            a.override_path.assign(p.begin(), p.end());
+            a.override_path.assign(p.begin(), p.end()); // ANSI->wide
         }
         else {
             return false;
@@ -146,7 +144,6 @@ static std::vector<std::wstring> enumerate_paths(const Args& a) {
         return paths;
     }
     for (auto p : xpmem::kAllDevicePaths) paths.emplace_back(p);
-    // ensure default present at least once
     if (paths.empty()) paths.emplace_back(xpmem::kDefaultDevicePath);
     return paths;
 }
@@ -212,4 +209,28 @@ int main(int argc, char** argv) try {
     std::vector<std::wstring> paths = enumerate_paths(a);
     std::vector<xpmem::Device> opened;
 
-    bool an
+    bool any_opened = false;
+    if (a.do_open || a.do_poke) {
+        any_opened = try_open_paths(paths, opened);
+        if (!any_opened) {
+            std::cout << "[-] No devices opened.\n";
+            return 1;
+        }
+    }
+
+    if (a.do_poke) {
+        if (a.poke_all) {
+            poke_all(opened, a.in_sz, a.out_sz);
+        } else {
+            std::vector<xpmem::Device> first;
+            first.emplace_back(std::move(opened.front()));
+            poke_all(first, a.in_sz, a.out_sz);
+        }
+    }
+
+    return any_opened ? 0 : 1;
+}
+catch (const std::exception& e) {
+    std::cerr << "[fatal] " << e.what() << "\n";
+    return 1;
+}
